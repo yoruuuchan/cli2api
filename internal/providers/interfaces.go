@@ -50,6 +50,10 @@ type ModelInfo struct {
 	Credits      string            `json:"credits,omitempty"`
 	Free         bool              `json:"free,omitempty"`
 	Capabilities ModelCapabilities `json:"capabilities"`
+	// Metered means the provider positively identified a credit-consuming model.
+	// False means free or unknown, not proof that requests are free. Auto models
+	// must not be declared metered because their resolved billing is unknown.
+	Metered bool `json:"-"`
 	// Scene is the provider-native scene/function a chat for this model must be
 	// sent under. Empty means the provider has no scene split. Providers use it
 	// to keep a model routed to the scene that actually serves it; it is
@@ -191,10 +195,12 @@ type QuotaWindow struct {
 // QuotaPackage is one upstream credit/resource pack with its own expiry.
 // EndsAt is a Unix second; EndTime is the provider-native wall-clock string.
 type QuotaPackage struct {
-	Remain  float64
-	Used    float64
-	Size    float64
-	Unit    string
+	Remain float64
+	Used   float64
+	Size   float64
+	Unit   string
+	// Scope follows accounts.QuotaPackageScopeAccountFEFO; empty is unknown.
+	Scope   string
 	EndsAt  int64
 	EndTime string
 }

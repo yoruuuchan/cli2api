@@ -1,6 +1,7 @@
 package workbuddy
 
 import (
+	"math"
 	"strconv"
 	"strings"
 	"unicode"
@@ -66,6 +67,7 @@ func catalogModel(model catalogModelEntry) providers.ModelInfo {
 		DisplayName: model.Name,
 		Credits:     credits,
 		Free:        catalogCreditsFree(credits),
+		Metered:     catalogCreditsMetered(credits) && !catalogModelAuto(model),
 		Capabilities: providers.ModelCapabilities{
 			ContextWindow:      window,
 			ContextWindowMax:   windowMax,
@@ -112,6 +114,24 @@ func catalogCreditsFree(credits string) bool {
 		return false
 	}
 	return value == 0
+}
+
+// catalogCreditsMetered accepts the catalog's numeric multiplier with its
+// optional x prefix and credits suffix. Unknown prose, negative values and
+// non-finite numbers must not become proof of credit consumption.
+func catalogCreditsMetered(credits string) bool {
+	text := strings.ToLower(strings.TrimSpace(credits))
+	text = strings.TrimSpace(strings.TrimPrefix(text, "x"))
+	text = strings.TrimSpace(strings.TrimSuffix(text, "credits"))
+	value, err := strconv.ParseFloat(text, 64)
+	return err == nil && value > 0 && !math.IsInf(value, 0)
+}
+
+func catalogModelAuto(model catalogModelEntry) bool {
+	id := accounts.CanonicalModelID(model.ID)
+	name := accounts.CanonicalModelID(model.Name)
+	return strings.TrimSpace(model.ID) == "" || id == "auto" || id == "default-model" ||
+		(strings.TrimSpace(model.Name) != "" && name == "auto")
 }
 
 func contextWindows(model catalogModelEntry) (int, int) {

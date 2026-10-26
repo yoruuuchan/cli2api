@@ -861,13 +861,13 @@ func TestModelsExposesOfficialCreditsAndFree(t *testing.T) {
 	for _, model := range models {
 		byID[model.NativeModel] = model
 	}
-	if m := byID["deepseek-v4.1-flash"]; m.Credits != "x0.00" || !m.Free {
+	if m := byID["deepseek-v4.1-flash"]; m.Credits != "x0.00" || !m.Free || m.Metered {
 		t.Fatalf("free model=%+v", m)
 	}
-	if m := byID["glm-5.3"]; m.Credits != "x0.79" || m.Free {
+	if m := byID["glm-5.3"]; m.Credits != "x0.79" || m.Free || !m.Metered {
 		t.Fatalf("paid model=%+v", m)
 	}
-	if m := byID["default-model"]; m.Credits != "" || m.Free {
+	if m := byID["default-model"]; m.Credits != "" || m.Free || m.Metered {
 		t.Fatalf("blank credits must not invent free: %+v", m)
 	}
 }
@@ -912,13 +912,13 @@ func TestModelsExposesCNCreditsAndFree(t *testing.T) {
 	for _, model := range models {
 		byID[model.NativeModel] = model
 	}
-	if m := byID["hy3"]; m.Credits != "x0.00 credits" || !m.Free {
+	if m := byID["hy3"]; m.Credits != "x0.00 credits" || !m.Free || m.Metered {
 		t.Fatalf("CN free model=%+v", m)
 	}
-	if m := byID["glm-5.2"]; m.Credits != "x0.79 credits" || m.Free {
+	if m := byID["glm-5.2"]; m.Credits != "x0.79 credits" || m.Free || !m.Metered {
 		t.Fatalf("CN paid model=%+v", m)
 	}
-	if m := byID["glm-5.1"]; m.Credits != "" || m.Free {
+	if m := byID["glm-5.1"]; m.Credits != "" || m.Free || m.Metered {
 		t.Fatalf("CN blank credits must not invent free: %+v", m)
 	}
 }
@@ -1491,8 +1491,8 @@ func TestUserResourceAggregation(t *testing.T) {
 				"Response": map[string]any{
 					"Data": map[string]any{
 						"Accounts": []map[string]any{
-							{"CycleCapacitySize": 2000, "CycleCapacityRemain": 1200, "CycleCapacityUsed": 800},
-							{"CycleCapacitySize": 500, "CycleCapacityRemain": 300, "CycleCapacityUsed": 200},
+							{"ProductCode": "p_tcaca", "CapacityUnit": "credits", "CycleCapacitySize": 2000, "CycleCapacityRemain": 1200, "CycleCapacityUsed": 800},
+							{"ProductCode": "p_tcaca", "CapacityUnit": "credits", "CycleCapacitySize": 500, "CycleCapacityRemain": 300, "CycleCapacityUsed": 200},
 						},
 					},
 				},
@@ -1530,9 +1530,9 @@ func TestUserResourcePackageExpiry(t *testing.T) {
 				"Response": map[string]any{
 					"Data": map[string]any{
 						"Accounts": []map[string]any{
-							{"CycleCapacitySize": 2000, "CycleCapacityRemain": 1200, "CycleCapacityUsed": 800, "CycleEndTime": "2026-12-31 23:59:59"},
-							{"CycleCapacitySize": 500, "CycleCapacityRemain": 300, "CycleCapacityUsed": 200, "CycleEndTime": "2026-10-01 00:00:00"},
-							{"CycleCapacitySize": 100, "CycleCapacityRemain": 100, "CycleCapacityUsed": 0},
+							{"ProductCode": "p_tcaca", "CapacityUnit": "credits", "CycleCapacitySize": 2000, "CycleCapacityRemain": 1200, "CycleCapacityUsed": 800, "CycleEndTime": "2026-12-31 23:59:59"},
+							{"ProductCode": "p_tcaca", "CapacityUnit": "credits", "CycleCapacitySize": 500, "CycleCapacityRemain": 300, "CycleCapacityUsed": 200, "CycleEndTime": "2026-10-01 00:00:00"},
+							{"ProductCode": "p_tcaca", "CapacityUnit": "credits", "CycleCapacitySize": 100, "CycleCapacityRemain": 100, "CycleCapacityUsed": 0},
 						},
 					},
 				},
@@ -1543,36 +1543,39 @@ func TestUserResourcePackageExpiry(t *testing.T) {
 		AccessToken: "at", RefreshToken: "rt", ExpiresAt: 4102444800, Domain: DomainCN, UID: "u1",
 	})
 	_ = store.SaveCredentialPayload(context.Background(), "acc1", CredentialFormat, payload)
-	info, err := client.Quota(context.Background(), "acc1")
+	credential, err := DecodeCredential(payload)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(info.Packages) != 3 {
-		t.Fatalf("packages=%+v", info.Packages)
+	_, _, _, packages, err := client.UserResource(context.Background(), "acc1", credential)
+	if err != nil {
+		t.Fatal(err)
 	}
-	// UTC+8 2026-10-01 00:00:00 = UTC 2026-09-30 16:00:00
+	if len(packages) != 3 {
+		t.Fatalf("packages=%+v", packages)
+	}
+	// UTC+8 2026-10-01 00:00:00 = UTC 2026-09-30 16:00:00.
+	// Freeze the cutoff so the fixture remains valid after that date.
 	want := time.Date(2026, 9, 30, 16, 0, 0, 0, time.UTC).Unix()
-	if info.ExpiresAt != want {
-		t.Fatalf("expires_at=%d want %d", info.ExpiresAt, want)
+	expiry, expiringRemain := soonestExpiryAt(packages, want-1)
+	if expiry != want || expiringRemain != 300 {
+		t.Fatalf("expires_at=%d expiring_remain=%v want %d/300", expiry, expiringRemain, want)
 	}
-	if info.ExpiringRemain != 300 {
-		t.Fatalf("expiring_remain=%v want 300", info.ExpiringRemain)
+	if packages[1].EndsAt != want || packages[1].EndTime != "2026-10-01 00:00:00" {
+		t.Fatalf("pkg=%+v", packages[1])
 	}
-	if info.Packages[1].EndsAt != want || info.Packages[1].EndTime != "2026-10-01 00:00:00" {
-		t.Fatalf("pkg=%+v", info.Packages[1])
-	}
-	if info.Packages[2].EndsAt != 0 {
-		t.Fatalf("unexpired pkg ends_at=%d want 0", info.Packages[2].EndsAt)
+	if packages[2].EndsAt != 0 {
+		t.Fatalf("unknown pkg ends_at=%d want 0", packages[2].EndsAt)
 	}
 }
 
 func TestSoonestExpiry(t *testing.T) {
-	expiresAt, remain := soonestExpiry([]providers.QuotaPackage{
+	expiresAt, remain := soonestExpiryAt([]providers.QuotaPackage{
 		{Remain: 100, EndsAt: 200},
 		{Remain: 50, EndsAt: 200},
 		{Remain: 300, EndsAt: 0},
 		{Remain: 400, EndsAt: 100},
-	})
+	}, 0)
 	if expiresAt != 100 || remain != 400 {
 		t.Fatalf("expiresAt=%d remain=%v", expiresAt, remain)
 	}

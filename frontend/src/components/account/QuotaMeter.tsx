@@ -5,7 +5,6 @@ import type { AccountQuota, AccountQuotaWindow } from '@/api/types'
 import {
   codexPlanLabel,
   formatQuotaAmount,
-  quotaExpiryLabel,
   quotaResetLabel,
   quotaTone,
   quotaUsedRatio,
@@ -27,17 +26,14 @@ type Props = {
   provider?: string
 }
 
-function extraQuotaLines(quota: AccountQuota, remainingLabel: string, addOnLabel: string, resourcePackageLabel: string, t: Translate, provider?: string) {
+function extraQuotaLines(quota: AccountQuota, remainingLabel: string, addOnLabel: string, resourcePackageLabel: string) {
   const addOn = quota.has_add_on && quota.add_on_available !== false
     ? `${addOnLabel} ${formatQuotaAmount(quota.add_on_used)} / ${formatQuotaAmount(quota.add_on_total)} ${quota.add_on_unit || 'credits'}`
     : ''
   const resourcePackage = quota.has_resource_package && quota.resource_package_available !== false
     ? `${resourcePackageLabel} ${remainingLabel} ${formatQuotaAmount(quota.resource_package_remaining)} ${quota.resource_package_unit || 'credits'}`
     : ''
-  // Package-expiry is a WorkBuddy-only surface; never render it for other
-  // providers even if a stale snapshot happens to carry the fields.
-  const expiry = provider === 'workbuddy' ? quotaExpiryLabel(quota, t) : ''
-  return [addOn, resourcePackage, expiry].filter(Boolean)
+  return [addOn, resourcePackage].filter(Boolean)
 }
 
 function WindowMeter({
@@ -101,7 +97,7 @@ export function QuotaMeter({ quota, t, label, usedLabel, remainingLabel, addOnLa
   const unit = quota.unit || 'credits'
   const used = `${formatQuotaAmount(quota.used)} / ${formatQuotaAmount(quota.total)}`
   const remaining = `${formatQuotaAmount(quota.remaining)}`
-  const extra = extraQuotaLines(quota, remainingLabel, addOnLabel, resourcePackageLabel, t, provider)
+  const extra = extraQuotaLines(quota, remainingLabel, addOnLabel, resourcePackageLabel)
   const windows = quotaWindows(quota)
   const plan = provider === 'codex' ? codexPlanLabel(quota.plan) : ''
   const ratio = quotaUsedRatio(quota)

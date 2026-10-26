@@ -20,7 +20,7 @@ Deploy with Docker, manage accounts in the web console, and connect clients thro
 ## Features
 
 - **Compatible APIs**: Chat Completions, Responses, Anthropic Messages, and model listing, with streaming and function tools.
-- **Multi-account routing**: automatic selection, session affinity, concurrency limits, cooldowns, and failover.
+- **Multi-account routing**: round-robin, weighted round-robin, fill-first, and opt-in earliest-expiry-first (FEFO), with session affinity, concurrency limits, cooldowns, and failover.
 - **Web console**: manage accounts, models, client keys, and proxies; view quotas and request logs.
 - **Docker operations**: persistent account data; an optional host updater lets you download, confirm, and roll back updates from the console.
 
@@ -70,6 +70,25 @@ The Go gateway handles authentication, routing, and request logging. Each Qoder 
 Accounts, models, access, and logs all live in one web console: readiness and quota are visible at a glance, and the Access page lets you copy the Base URL and run a quick check.
 
 Account cards provide WorkBuddy, QwenWork CN/Global, Qoder CN, and Qoder Global check-in actions and automatic check-in switches (off by default), with history under More → Check-in records; no separate check-in page is needed. Set each provider's default time under System → Automatic check-in, then choose inheritance or an override in Edit account. Default changes apply to inheriting accounts immediately. Existing WorkBuddy accounts retain their previous times until switched to inheritance. Inactive campaigns are skipped. Live-account check-in acceptance is still pending. QwenWork ships a check-in API in its desktop client, but production gateways do not route it (404): CN confirms the daily free credits from the wallet balance, while Global can only report the total quota and the skip reason.
+
+## Earliest-expiry-first (FEFO)
+
+Select **Earliest expiry first (FEFO)** under **System → Account routing strategy**, or send `{"routing_strategy":"fefo"}` to `PATCH /api/system/settings` with administrator authentication. Round-robin remains the default; existing weighted round-robin and fill-first behavior is unchanged.
+
+- **Establish applicability first.** Model compatibility, health, grants, region, concurrency, and cooldown gates still apply. Only positive, unexpired packages that can actually fund the model qualify. Free models, Auto, and unknown prices are not assumed to spend credits; explicitly free models can still use exhausted accounts.
+- **Rank by the nearest spendable package date.** Ignore depleted/expired packages on multi-package accounts. Known priority requires provider-confirmed applicability and earliest-expiring-first upstream deduction. Accounts expiring on the same **UTC+8 calendar day** rotate fairly, regardless of weights. Unknown dates/scopes come after known batches; an all-unknown cohort uses the existing round-robin rather than guessed dates.
+- **Keep established bindings.** Session affinity and explicit account pins precede FEFO; existing failure, cooldown, concurrency, and quota escape rules still apply. Finishing a response/stream asynchronously coalesces quota refreshes per account; fresh upstream balances immediately affect ranking. Check-ins, manual refreshes, and cached packages expiring also affect the next selection. There is no estimated balance or guarantee of upstream debit timing.
+- **Use one display calculation.** Cards and overview show the nearest active date, local calendar days left, and credits expiring that day. Expand all package balances/dates, including depleted/expired packages. Dates use the browser's timezone, which can differ from the routing calendar. Missing expiry explicitly says **Expiry unknown**; reset windows, token lifetimes, and unparsed date text are never substituted.
+
+Current support:
+
+| Provider / account type | FEFO and date source |
+| --- | --- |
+| WorkBuddy CN / Global personal accounts | Known positive-price models with complete, unrestricted `p_tcaca` credits packages; native `CycleEndTime` in UTC+8 and precise decimal balances. Deduction order is grounded in the [CN credit rules](https://www.codebuddy.cn/docs/ide/Account/credits) and [WorkBuddy credit rules](https://www.codebuddy.ai/docs/zh/workbuddy/credits), not inferred from account totals. |
+| WorkBuddy enterprise/shared identities, unconfirmed lists reaching 100 results, unknown products/units/deduction restrictions | No known FEFO priority. Real package dates may still be displayed without claiming that a request can spend those packages. |
+| Qoder, Trae, Devin, Command Code, Codex, Zhipu, QwenWork | Current adapters do not provide verifiable per-package expiry plus applicability/deduction order; retain unknown priority and round-robin fallback. Reset windows, subscription dates, and check-in reward definitions are not expiry of spendable packages. |
+
+FEFO selects accounts; it does not change upstream billing, plans, or region rules. Refresh quotas and model catalogs before expecting old caches to acquire verified FEFO metadata.
 
 ## Limitations
 

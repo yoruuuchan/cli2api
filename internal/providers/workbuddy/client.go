@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -852,9 +853,24 @@ func (c *Client) Quota(ctx context.Context, accountID string) (*providers.QuotaI
 	if err != nil {
 		return nil, err
 	}
-	remain, used, total, packages, err := c.UserResource(ctx, accountID, credential)
+	integerRemain, integerUsed, integerTotal, packages, err := c.UserResource(ctx, accountID, credential)
 	if err != nil {
 		return nil, err
+	}
+	remain, used, total := float64(integerRemain), float64(integerUsed), float64(integerTotal)
+	if len(packages) > 0 {
+		// Integer fields truncate fractional credits. The precise package values
+		// must also drive Exceeded, or a spendable 0.69-credit balance becomes
+		// account-wide exhaustion before FEFO can consider the package.
+		remain, used, total = 0, 0, 0
+		for _, pkg := range packages {
+			remain += pkg.Remain
+			used += pkg.Used
+			total += pkg.Size
+		}
+		if math.IsInf(remain, 0) || math.IsInf(used, 0) || math.IsInf(total, 0) {
+			return nil, fmt.Errorf("user-resource quota exceeds finite balance range")
+		}
 	}
 	if total <= 0 && remain > 0 {
 		total = remain
@@ -864,7 +880,7 @@ func (c *Client) Quota(ctx context.Context, accountID string) (*providers.QuotaI
 	}
 	percentage := 0.0
 	if total > 0 {
-		percentage = (float64(used) / float64(total)) * 100
+		percentage = (used / total) * 100
 		if percentage < 0 {
 			percentage = 0
 		}
@@ -874,9 +890,9 @@ func (c *Client) Quota(ctx context.Context, accountID string) (*providers.QuotaI
 	}
 	expiresAt, expiringRemain := soonestExpiry(packages)
 	return &providers.QuotaInfo{
-		Used:           float64(used),
-		Total:          float64(total),
-		Remaining:      float64(remain),
+		Used:           used,
+		Total:          total,
+		Remaining:      remain,
 		Percentage:     percentage,
 		Unit:           "credits",
 		Exceeded:       total > 0 && remain <= 0,
@@ -1023,7 +1039,7 @@ func (c *Client) Keepalive(ctx context.Context, accountID string) error {
 // UserResource aggregates package remain/used/total from get-user-resource.
 // packages carries the per-pack expiry detail parsed from CycleEndTime.
 func (c *Client) UserResource(ctx context.Context, accountID string, credential Credential) (remain, used, total int64, packages []providers.QuotaPackage, err error) {
-	now := time.Now()
+	now := time.Now().In(cycleEndTimeZone)
 	payload, err := json.Marshal(map[string]any{
 		"PageNumber":               1,
 		"PageSize":                 100,
@@ -1061,11 +1077,32 @@ func (c *Client) UserResource(ctx context.Context, accountID string, credential 
 	if env.Code != 0 {
 		return 0, 0, 0, nil, fmt.Errorf("user-resource code=%d msg=%s", env.Code, env.Msg)
 	}
-	remain, used, total = aggregateUserResource(env.Data.Response.Data.Accounts, env.Data.Response.Data.TotalDosage)
-	return remain, used, total, quotaPackages(env.Data.Response.Data.Accounts), nil
+	rawPackages := env.Data.Response.Data.Accounts
+	for _, pkg := range rawPackages {
+		if _, _, _, valid := precisePackageRemainUsed(pkg); !valid {
+			// Clearing Scope alone is insufficient: an approximate integer zero
+			// would still become account-wide Exceeded for every strategy. Reject
+			// this refresh so runtime retains the previous trustworthy snapshot.
+			return 0, 0, 0, nil, errors.New("user-resource quota has invalid or incomplete precise amounts")
+		}
+	}
+	remain, used, total = aggregateUserResource(rawPackages, env.Data.Response.Data.TotalDosage)
+	packages = quotaPackages(rawPackages)
+	// The personal credit packs below are account-wide. Enterprise resources
+	// may instead belong to a shared pool or an unselected identity; do not
+	// claim that this credential can spend them. A full page also leaves the
+	// earliest/depleted inference unknown until pagination is supported.
+	if credential.EnterpriseID != "" || len(rawPackages) >= 100 {
+		for i := range packages {
+			packages[i].Scope = ""
+		}
+	}
+	return remain, used, total, packages, nil
 }
 
 type resourcePackage struct {
+	ProductCode         string `json:"ProductCode"`
+	CapacityUnit        string `json:"CapacityUnit"`
 	CapacityRemain      int64  `json:"CapacityRemain"`
 	CapacityUsed        int64  `json:"CapacityUsed"`
 	CapacitySize        int64  `json:"CapacitySize"`
@@ -1073,23 +1110,44 @@ type resourcePackage struct {
 	CycleCapacityUsed   int64  `json:"CycleCapacityUsed"`
 	CycleCapacitySize   int64  `json:"CycleCapacitySize"`
 	CycleEndTime        string `json:"CycleEndTime"`
+	// Precise amounts are decimal strings (or numbers) in the same credits
+	// unit, not scaled integers. Keep raw values to reject malformed fields
+	// without silently converting them into a zero balance.
+	CapacityRemainPrecise      json.RawMessage `json:"CapacityRemainPrecise"`
+	CapacityUsedPrecise        json.RawMessage `json:"CapacityUsedPrecise"`
+	CapacitySizePrecise        json.RawMessage `json:"CapacitySizePrecise"`
+	CycleCapacityRemainPrecise json.RawMessage `json:"CycleCapacityRemainPrecise"`
+	CycleCapacityUsedPrecise   json.RawMessage `json:"CycleCapacityUsedPrecise"`
+	CycleCapacitySizePrecise   json.RawMessage `json:"CycleCapacitySizePrecise"`
+	DeductionProperties        json.RawMessage `json:"DeductionProperties"`
+	AccountAttributes          json.RawMessage `json:"AccountAttributes"`
 }
 
 // cycleEndTimeZone is the UTC+8 wall clock the upstream billing API uses for
 // CycleEndTime ("2006-01-02 15:04:05").
 var cycleEndTimeZone = time.FixedZone("UTC+8", 8*60*60)
 
-// quotaPackages converts raw packs into per-pack expiry detail for the
-// console. A pack with no parseable CycleEndTime keeps EndsAt zero.
+// quotaPackages converts personal resource packs into expiry detail. Only
+// explicitly identified p_tcaca/credits packs declare account-wide FEFO.
+// These packs share the paid-model credit balance, and upstream spends the
+// earliest-expiring pack first (base before bonus when expiry is identical):
+// https://www.codebuddy.cn/docs/workbuddy/Credits
+// https://www.codebuddy.ai/docs/zh/workbuddy/credits
+// UserResource clears this declaration for enterprise or incomplete snapshots.
+// A pack with no parseable CycleEndTime keeps EndsAt zero (unknown expiry).
 func quotaPackages(packages []resourcePackage) []providers.QuotaPackage {
 	out := make([]providers.QuotaPackage, 0, len(packages))
 	for _, pkg := range packages {
-		remain, used, size := packageRemainUsed(pkg)
+		remain, used, size, preciseOK := precisePackageRemainUsed(pkg)
 		entry := providers.QuotaPackage{
-			Remain: float64(remain),
-			Used:   float64(used),
-			Size:   float64(size),
-			Unit:   "credits",
+			Remain: remain,
+			Used:   used,
+			Size:   size,
+			Unit:   pkg.CapacityUnit,
+		}
+		if preciseOK && resourceListEmpty(pkg.DeductionProperties) && resourceAccountAttributesSafe(pkg.AccountAttributes) &&
+			pkg.ProductCode == "p_tcaca" && pkg.CapacityUnit == "credits" {
+			entry.Scope = accounts.QuotaPackageScopeAccountFEFO
 		}
 		if trimmed := strings.TrimSpace(pkg.CycleEndTime); trimmed != "" {
 			if parsed, err := time.ParseInLocation("2006-01-02 15:04:05", trimmed, cycleEndTimeZone); err == nil {
@@ -1102,11 +1160,166 @@ func quotaPackages(packages []resourcePackage) []providers.QuotaPackage {
 	return out
 }
 
-// soonestExpiry returns the earliest non-zero pack expiry and the remaining
-// amount that expires at that time.
+// resourceListEmpty deliberately refuses to interpret restriction objects.
+// Only an absent/null or explicitly empty list can assert account-wide credits.
+func resourceListEmpty(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return true
+	}
+	var values []json.RawMessage
+	return json.Unmarshal(trimmed, &values) == nil && len(values) == 0
+}
+
+// resourceAccountAttributesSafe recognizes only the observed personal payer
+// metadata. Values such as the payer identifier remain transient and must never
+// be copied into quota snapshots or logs. An unfamiliar attribute may restrict
+// model applicability or refer to a shared payer, so it cannot declare FEFO.
+func resourceAccountAttributesSafe(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return true
+	}
+	if !json.Valid(trimmed) {
+		return false
+	}
+	var attributes []struct {
+		Key   string          `json:"Key"`
+		Type  int             `json:"Type"`
+		Value json.RawMessage `json:"Value"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(trimmed))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&attributes); err != nil {
+		return false
+	}
+	for _, attribute := range attributes {
+		if len(attribute.Value) == 0 {
+			return false
+		}
+		switch attribute.Key {
+		case "grantSource":
+			if attribute.Type != 3 {
+				return false
+			}
+		case "payerUin":
+			if attribute.Type != 5 {
+				return false
+			}
+		case "payerType":
+			var payerType string
+			if attribute.Type != 5 || json.Unmarshal(attribute.Value, &payerType) != nil || payerType != "0" {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// preciseCredit accepts only a finite, non-negative decimal string or JSON
+// number. Empty/null fields mean unreported; malformed fields are not zero.
+func preciseCredit(raw json.RawMessage) (value float64, reported, valid bool) {
+	text := strings.TrimSpace(string(raw))
+	if text == "" || text == "null" {
+		return 0, false, true
+	}
+	if strings.HasPrefix(text, "\"") {
+		if err := json.Unmarshal(raw, &text); err != nil {
+			return 0, true, false
+		}
+		text = strings.TrimSpace(text)
+		if text == "" {
+			return 0, false, true
+		}
+	}
+	// ParseFloat also recognizes hexadecimal/non-finite spellings. The API's
+	// precise fields are decimal; unfamiliar encodings must remain unknown.
+	for _, ch := range text {
+		if (ch >= '0' && ch <= '9') || ch == '.' || ch == '+' || ch == '-' || ch == 'e' || ch == 'E' {
+			continue
+		}
+		return 0, true, false
+	}
+	parsed, err := strconv.ParseFloat(text, 64)
+	if err != nil {
+		return 0, true, false
+	}
+	return parsed, true, parsed >= 0 && !math.IsNaN(parsed) && !math.IsInf(parsed, 0)
+}
+
+func preciseCreditGroup(raw [3]json.RawMessage) (values [3]float64, reported [3]bool, valid bool) {
+	valid = true
+	for i, value := range raw {
+		var ok bool
+		values[i], reported[i], ok = preciseCredit(value)
+		valid = valid && ok
+	}
+	return values, reported, valid
+}
+
+// precisePackageRemainUsed preserves cycle precedence even when a cycle is
+// depleted but the lifetime capacity still shows credits. Precise fields are
+// not a scale factor: 0.69 is a live fractional balance, not integer zero.
+// Any malformed precise value returns integer fallback data with valid=false.
+// UserResource rejects that refresh before publishing an approximate snapshot;
+// the package converter also refuses to assert FEFO for invalid precision.
+func precisePackageRemainUsed(pkg resourcePackage) (remain, used, size float64, valid bool) {
+	r, u, s := packageRemainUsed(pkg)
+	remain, used, size = float64(r), float64(u), float64(s)
+	fallback := func() (float64, float64, float64, bool) { return remain, used, size, false }
+	cycle, cycleReported, cycleValid := preciseCreditGroup([3]json.RawMessage{
+		pkg.CycleCapacityRemainPrecise, pkg.CycleCapacityUsedPrecise, pkg.CycleCapacitySizePrecise,
+	})
+	capacity, capacityReported, capacityValid := preciseCreditGroup([3]json.RawMessage{
+		pkg.CapacityRemainPrecise, pkg.CapacityUsedPrecise, pkg.CapacitySizePrecise,
+	})
+	if !cycleValid || !capacityValid {
+		return fallback()
+	}
+	values, reported := cycle, cycleReported
+	base := [3]float64{float64(pkg.CycleCapacityRemain), float64(pkg.CycleCapacityUsed), float64(pkg.CycleCapacitySize)}
+	if !cycleReported[0] && !cycleReported[1] && !cycleReported[2] {
+		if pkg.CycleCapacitySize > 0 || pkg.CycleCapacityRemain > 0 || pkg.CycleCapacityUsed > 0 ||
+			(!capacityReported[0] && !capacityReported[1] && !capacityReported[2]) {
+			return remain, used, size, true
+		}
+		values, reported = capacity, capacityReported
+		base = [3]float64{float64(pkg.CapacityRemain), float64(pkg.CapacityUsed), float64(pkg.CapacitySize)}
+	}
+	// A precise size alone cannot recover a fractional remaining balance.
+	if !reported[0] && !reported[1] {
+		return fallback()
+	}
+	for i, present := range reported {
+		if present {
+			base[i] = values[i]
+		}
+	}
+	if !reported[0] {
+		base[0] = base[2] - base[1]
+	}
+	if !reported[1] {
+		base[1] = base[2] - base[0]
+	}
+	if base[0] < 0 || base[1] < 0 || base[2] < 0 || base[0] > base[2] || base[1] > base[2] ||
+		math.Abs(base[0]+base[1]-base[2]) > 1e-9*math.Max(1, base[2]) {
+		return fallback()
+	}
+	return base[0], base[1], base[2], true
+}
+
+// soonestExpiry returns the earliest future expiry of a positive balance and
+// the remaining amount that expires at that time. This display summary is not
+// a routing eligibility declaration; routing must also honor package Scope.
 func soonestExpiry(packages []providers.QuotaPackage) (expiresAt int64, expiringRemain float64) {
+	return soonestExpiryAt(packages, time.Now().Unix())
+}
+
+func soonestExpiryAt(packages []providers.QuotaPackage, nowUnix int64) (expiresAt int64, expiringRemain float64) {
 	for _, pkg := range packages {
-		if pkg.EndsAt <= 0 {
+		if pkg.EndsAt <= 0 || pkg.EndsAt <= nowUnix || !(pkg.Remain > 0) {
 			continue
 		}
 		if expiresAt == 0 || pkg.EndsAt < expiresAt {

@@ -232,7 +232,7 @@ export function SystemPage() {
               <div className="grid size-8 shrink-0 place-items-center rounded-lg bg-surface-secondary text-foreground"><SlidersHorizontal size={15} /></div>
               <div>
                 <h3 className="font-semibold">{t('routingStrategyTitle')}</h3>
-                <p className="mt-1 text-caption leading-5 text-muted">{t('routingStrategyHint')}</p>
+                <p className="mt-1 text-caption leading-5 text-muted">{t(settings?.routing_strategy === 'fefo' ? 'routingFefoHint' : 'routingStrategyHint')}</p>
               </div>
             </div>
             <div className="mt-4 pt-4">
@@ -255,6 +255,7 @@ export function SystemPage() {
                       <ListBox.Item id="round-robin" textValue="round-robin"><Label>{t('routingRoundRobin')}</Label><ListBox.ItemIndicator /></ListBox.Item>
                       <ListBox.Item id="weighted-round-robin" textValue="weighted-round-robin"><Label>{t('routingWeightedRoundRobin')}</Label><ListBox.ItemIndicator /></ListBox.Item>
                       <ListBox.Item id="fill-first" textValue="fill-first"><Label>{t('routingFillFirst')}</Label><ListBox.ItemIndicator /></ListBox.Item>
+                      <ListBox.Item id="fefo" textValue="fefo"><Label>{t('routingFefo')}</Label><ListBox.ItemIndicator /></ListBox.Item>
                     </ListBox>
                   </Select.Popover>
                 </Select>

@@ -137,9 +137,18 @@ func (m *Manager) fetchProviderModels(ctx context.Context, item Item) {
 		log.Printf("catalog fetch failed account=%s provider=%s: %v", item.ID, item.Provider, err)
 		return
 	}
-	ids := make([]string, 0, len(models)*2)
+	ids := make([]string, 0, len(models)*3)
+	var freeModels, meteredModels []string
 	for _, model := range models {
-		ids = append(ids, model.PublicModel, model.NativeModel, model.DisplayName)
+		keys := []string{model.PublicModel, model.NativeModel, model.DisplayName}
+		ids = append(ids, keys...)
+		// Known zero-price models take precedence over a conflicting metered
+		// claim. Unknown pricing is neither free nor eligible for FEFO.
+		if model.Free {
+			freeModels = append(freeModels, keys...)
+		} else if model.Metered {
+			meteredModels = append(meteredModels, keys...)
+		}
 	}
-	m.pool.MergeModels(item.ID, ids)
+	m.pool.MergeModelCatalog(item.ID, ids, freeModels, meteredModels)
 }

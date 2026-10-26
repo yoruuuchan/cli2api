@@ -50,6 +50,9 @@ type Item struct {
 	// exhausted can still serve it and must not be filtered out on quota
 	// alone. Nil means the provider reported no pricing.
 	FreeModels []string
+	// MeteredModels are catalog IDs confirmed to consume the account's credit
+	// packages. Missing/unknown pricing is not evidence of credit consumption.
+	MeteredModels []string
 	// ProvenModels are public IDs this account has actually served. A
 	// later catalog refresh must not drop a model that just succeeded:
 	// WorkBuddy CLI snapshots can omit a live ID and would otherwise
@@ -106,6 +109,9 @@ type RouteQuery struct {
 	// protocol (for example native Responses input the chat form cannot
 	// carry). Nil admits every item.
 	Eligible func(Item) bool
+	// fefoNow is set only by a FEFO pool. Other strategies keep the historical
+	// quota gate, even when a cached package has since expired.
+	fefoNow time.Time
 }
 
 func itemRegion(item Item) string {
@@ -324,7 +330,7 @@ func itemServesFreeModel(item Item, publicModel string) bool {
 }
 
 func routeBaseMatches(item Item, q RouteQuery) bool {
-	if item.Quota != nil && item.Quota.Exceeded && !itemServesFreeModel(item, q.PublicModel) {
+	if routeQuotaExceeded(item, q) {
 		return false
 	}
 	return routeReadyAndScoped(item, q)
@@ -360,7 +366,7 @@ func routeReadyAndScoped(item Item, q RouteQuery) bool {
 // that its quota is exceeded. Free-model accounts are never quota-blocked:
 // they spend no credits, so an exhausted account can still serve them.
 func routeBlockedByQuota(item Item, q RouteQuery) bool {
-	if item.Quota == nil || !item.Quota.Exceeded || itemServesFreeModel(item, q.PublicModel) {
+	if !routeQuotaExceeded(item, q) {
 		return false
 	}
 	return routeReadyAndScoped(item, q) && itemCouldServeModel(item, q.PublicModel)
@@ -489,6 +495,9 @@ func (p *Pool) LenRoute(q RouteQuery) int {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.routingStrategy == RoutingStrategyFEFO {
+		q.fefoNow = time.Now()
+	}
 	count := 0
 	for _, item := range p.items {
 		if routeMatches(item, q) {
@@ -508,6 +517,9 @@ func (p *Pool) QuotaBlockedForModel(q RouteQuery) (Item, bool) {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.routingStrategy == RoutingStrategyFEFO {
+		q.fefoNow = time.Now()
+	}
 	for _, item := range p.items {
 		if routeBlockedByQuota(item, q) {
 			return item, true
@@ -553,6 +565,9 @@ func (p *Pool) PickRoute(q RouteQuery) (Item, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := time.Now()
+	if p.routingStrategy == RoutingStrategyFEFO {
+		q.fefoNow = now
+	}
 	eligible := make([]int, 0, len(p.items))
 	for i, item := range p.items {
 		if routeMatches(item, q) {
@@ -652,6 +667,9 @@ func (p *Pool) PickRoute(q RouteQuery) (Item, bool) {
 		}
 	} else {
 		p.lastRegion[key] = itemRegion(available[0])
+	}
+	if p.routingStrategy == RoutingStrategyFEFO {
+		available = fefoCandidates(available, q.PublicModel, now)
 	}
 	if p.routingStrategy == RoutingStrategyFillFirst {
 		picked := pickFillFirst(available)
@@ -1314,6 +1332,12 @@ func (p *Pool) MergeNativeModels(id string, nativeModels map[string]string) {
 // provider reported no pricing, which is treated as "nothing known is free"
 // rather than "everything is free".
 func (p *Pool) MergeModelsWithPricing(id string, models, freeModels []string) {
+	p.MergeModelCatalog(id, models, freeModels, nil)
+}
+
+// MergeModelCatalog atomically replaces model availability and pricing. A new
+// catalog with no metered declarations clears old FEFO eligibility immediately.
+func (p *Pool) MergeModelCatalog(id string, models, freeModels, meteredModels []string) {
 	if p == nil || id == "" {
 		return
 	}
@@ -1345,12 +1369,29 @@ func (p *Pool) MergeModelsWithPricing(id string, models, freeModels []string) {
 		freeSeen[canonical] = struct{}{}
 		free = append(free, native)
 	}
+	metered := make([]string, 0, len(meteredModels))
+	meteredSeen := map[string]struct{}{}
+	for _, model := range meteredModels {
+		canonical := CanonicalModelID(model)
+		if _, isFree := freeSeen[canonical]; isFree || canonical == "auto" {
+			continue
+		}
+		if _, exists := seen[canonical]; !exists {
+			continue
+		}
+		if _, duplicate := meteredSeen[canonical]; duplicate {
+			continue
+		}
+		meteredSeen[canonical] = struct{}{}
+		metered = append(metered, canonical)
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for i := range p.items {
 		if p.items[i].ID == id {
 			p.items[i].Models = copied
 			p.items[i].FreeModels = free
+			p.items[i].MeteredModels = metered
 			p.items[i].ModelsAt = time.Now()
 			return
 		}
@@ -1493,6 +1534,9 @@ func (item Item) clone() Item {
 	if item.ProvenModels != nil {
 		out.ProvenModels = append([]string(nil), item.ProvenModels...)
 	}
+	if item.MeteredModels != nil {
+		out.MeteredModels = append([]string(nil), item.MeteredModels...)
+	}
 	if item.Quota != nil {
 		q := *item.Quota
 		out.Quota = &q
@@ -1599,6 +1643,9 @@ func (p *Pool) Upsert(item Item) {
 			// list still overrides the carried-forward one.
 			if item.FreeModels == nil {
 				item.FreeModels = p.items[i].FreeModels
+			}
+			if item.MeteredModels == nil {
+				item.MeteredModels = p.items[i].MeteredModels
 			}
 			// Same reasoning for the gateway-key mapping: a runtime Upsert does
 			// not re-read the catalog, so losing it would send the public model

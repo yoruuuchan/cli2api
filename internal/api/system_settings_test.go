@@ -70,19 +70,34 @@ func TestSystemSettingsRoutePersistsAndAppliesRoutingStrategy(t *testing.T) {
 	})
 	defer srv.Close()
 
-	request := httptest.NewRequest(http.MethodPatch, "/api/system/settings", bytes.NewBufferString(`{"routing_strategy":"fill-first"}`))
+	if got := srv.Pool.RoutingStrategy(); got != accounts.RoutingStrategyRoundRobin {
+		t.Fatalf("default strategy = %q", got)
+	}
+	for _, strategy := range []string{accounts.RoutingStrategyRoundRobin, accounts.RoutingStrategyWeightedRoundRobin, accounts.RoutingStrategyFillFirst, accounts.RoutingStrategyFEFO} {
+		t.Run(strategy, func(t *testing.T) {
+			body := `{"routing_strategy":"` + strategy + `"}`
+			request := httptest.NewRequest(http.MethodPatch, "/api/system/settings", bytes.NewBufferString(body))
+			request.Header.Set("Authorization", "Bearer secret")
+			response := httptest.NewRecorder()
+			srv.Handler().ServeHTTP(response, request)
+			if response.Code != http.StatusOK || !bytes.Contains(response.Body.Bytes(), []byte(`"routing_strategy":"`+strategy+`"`)) {
+				t.Fatalf("updated settings: %d %s", response.Code, response.Body.String())
+			}
+			if got := srv.Pool.RoutingStrategy(); got != strategy {
+				t.Fatalf("runtime strategy = %q", got)
+			}
+			value, ok, err := srv.Manager.Store().GetSecret(context.Background(), routingStrategySecret)
+			if err != nil || !ok || value != strategy {
+				t.Fatalf("persisted strategy=%q ok=%v err=%v", value, ok, err)
+			}
+		})
+	}
+	request := httptest.NewRequest(http.MethodPatch, "/api/system/settings", bytes.NewBufferString(`{"routing_strategy":"guessed-expiry"}`))
 	request.Header.Set("Authorization", "Bearer secret")
 	response := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(response, request)
-	if response.Code != http.StatusOK || !bytes.Contains(response.Body.Bytes(), []byte(`"routing_strategy":"fill-first"`)) {
-		t.Fatalf("updated settings: %d %s", response.Code, response.Body.String())
-	}
-	if got := srv.Pool.RoutingStrategy(); got != accounts.RoutingStrategyFillFirst {
-		t.Fatalf("runtime strategy = %q", got)
-	}
-	value, ok, err := srv.Manager.Store().GetSecret(context.Background(), routingStrategySecret)
-	if err != nil || !ok || value != accounts.RoutingStrategyFillFirst {
-		t.Fatalf("persisted strategy=%q ok=%v err=%v", value, ok, err)
+	if response.Code != http.StatusBadRequest || srv.Pool.RoutingStrategy() != accounts.RoutingStrategyFEFO {
+		t.Fatalf("invalid strategy changed settings: %d %s", response.Code, response.Body.String())
 	}
 }
 

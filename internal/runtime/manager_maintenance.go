@@ -476,6 +476,18 @@ func quotaNeedsRevalidation(item Item, now time.Time) bool {
 		!item.DownUntil.IsZero() && now.Before(item.DownUntil)
 }
 
+// quotaNeedsRevalidationFor reports whether this manager should re-probe the
+// account. Besides an exhausted headline snapshot, an opt-in FEFO account
+// whose trusted scoped packages are all depleted/expired also needs a probe:
+// FEFO filters it out, so no request (and no after-use refresh) can discover a
+// newly granted package. Unknown scopes or dates never trigger this.
+func (manager *Manager) quotaNeedsRevalidationFor(item Item, now time.Time) bool {
+	if quotaNeedsRevalidation(item, now) {
+		return true
+	}
+	return manager != nil && manager.pool != nil && manager.pool.FEFOQuotaDepleted(item.ID)
+}
+
 // refreshStaleQuota re-fetches quota for accounts whose cached snapshot still
 // reports Exceeded. A snapshot can go stale when upstream credits are
 // replenished out-of-band (billing reset, add-on purchase) or when a flaky
@@ -503,7 +515,7 @@ func (manager *Manager) refreshStaleQuota(ctx context.Context) {
 		if item.RuntimeState == "dead" {
 			continue
 		}
-		if !quotaNeedsRevalidation(item, now) {
+		if !manager.quotaNeedsRevalidationFor(item, now) {
 			// Recovered (or never exhausted): the next exhaustion is a new
 			// episode and starts from the 5-minute probes again.
 			manager.resetQuotaProbeLevel(item.ID)
@@ -527,7 +539,7 @@ func (manager *Manager) refreshStaleQuota(ctx context.Context) {
 			// Probe failed (upstream/network). Keep the level so the next
 			// sweep retries at the same cadence instead of escalating a
 			// transient outage into an hours-long wait.
-		case updated.Quota.Exceeded:
+		case updated.Quota.Exceeded || manager.pool.FEFOQuotaDepleted(item.ID):
 			manager.bumpQuotaProbeLevel(item.ID)
 		default:
 			manager.resetQuotaProbeLevel(item.ID)

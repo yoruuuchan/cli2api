@@ -19,6 +19,7 @@ import gsap from 'gsap'
 import { ProviderMark } from '@/components/ProviderMark'
 import { CompactSwitch } from '@/components/ui/CompactSwitch'
 import { QuotaMeter } from '@/components/account/QuotaMeter'
+import { QuotaExpiry } from '@/components/account/QuotaExpiry'
 import { RuntimeMeter } from '@/components/account/RuntimeMeter'
 import {
   accountState,
@@ -261,6 +262,7 @@ export function AccountCard({
             provider={account.provider}
           />
         ) : <span className="text-caption text-foreground/65">{state === 'hot' || state === 'ready' || state === 'loading' || state === 'starting' ? t('quotaLoading') : t('quotaUnavailable')}</span>}
+        <QuotaExpiry quota={account.quota} t={t} />
 
         {lastError ? (
           <Tooltip>

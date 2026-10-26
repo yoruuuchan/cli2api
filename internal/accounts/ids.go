@@ -9,6 +9,7 @@ const (
 	RoutingStrategyRoundRobin         = "round-robin"
 	RoutingStrategyWeightedRoundRobin = "weighted-round-robin"
 	RoutingStrategyFillFirst          = "fill-first"
+	RoutingStrategyFEFO               = "fefo"
 )
 
 func NormalizeRoutingStrategy(strategy string) string {
@@ -17,6 +18,8 @@ func NormalizeRoutingStrategy(strategy string) string {
 		return RoutingStrategyFillFirst
 	case RoutingStrategyWeightedRoundRobin:
 		return RoutingStrategyWeightedRoundRobin
+	case RoutingStrategyFEFO:
+		return RoutingStrategyFEFO
 	default:
 		return RoutingStrategyRoundRobin
 	}
